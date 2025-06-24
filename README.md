@@ -18,3 +18,5 @@ Linux : `./Udp2Tcp2UdpGameProxy server 0.0.0.0 7778 127.0.0.1 7777`
 Windows : `Udp2Tcp2UdpGameProxy.exe client 127.0.0.1 7777 your-vps-ip 7778`
 
 Linux : `Udp2Tcp2UdpGameProxy client 127.0.0.1 7777 your-vps-ip 7778`
+
+游戏连接服务器到 : `127.0.01:7777`
