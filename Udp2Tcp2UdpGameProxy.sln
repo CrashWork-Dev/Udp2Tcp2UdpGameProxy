@@ -1,6 +1,6 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Udp2Tcp2UdpGameProxy", "Udp2Tcp2UdpGameProxy\Udp2Tcp2UdpGameProxy.csproj", "{7E6DFC1C-0D12-4E61-815C-DB440776B009}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Udp2Tcp2UdpGameProxy", "Udp2Tcp2UdpGameProxy.csproj", "{7E6DFC1C-0D12-4E61-815C-DB440776B009}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
