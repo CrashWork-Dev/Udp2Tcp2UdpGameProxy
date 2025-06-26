@@ -1,4 +1,5 @@
 ﻿using System.Net;
+// ReSharper disable InconsistentNaming
 
 namespace Udp2Tcp2UdpGameProxy;
 
@@ -29,11 +30,13 @@ public static class Program
         }
 
         var mode = args[0].ToLower();
-
+        
+        using var cancellationTokenSource = new CancellationTokenSource();
+        
         Console.CancelKeyPress += (_, e) =>
         {
             e.Cancel = true;
-            Environment.Exit(0);
+            cancellationTokenSource.Cancel();
         };
 
         try
@@ -50,8 +53,8 @@ public static class Program
                     var tcpListenEndPoint = new IPEndPoint(tcpListenIp, tcpListenPort);
                     var udpGameServerEndPoint = new IPEndPoint(udpGameServerIp, udpGameServerPort);
 
-                    var server = new TcpToUdpServer(tcpListenEndPoint, udpGameServerEndPoint);
-                    await server.StartAsync();
+                    using var server = new TcpToUdpServer(tcpListenEndPoint, udpGameServerEndPoint);
+                    await server.StartAsync(cancellationTokenSource.Token);
                     break;
                 }
                 case "client" when args.Length >= 5:
@@ -64,8 +67,8 @@ public static class Program
                     var udpLocalEndPoint = new IPEndPoint(udpLocalIp, udpLocalPort);
                     var tcpRemoteEndPoint = new IPEndPoint(tcpRemoteIp, tcpRemotePort);
 
-                    var client = new UdpToTcpClient(udpLocalEndPoint, tcpRemoteEndPoint);
-                    await client.StartAsync();
+                    using var client = new UdpToTcpClient(udpLocalEndPoint, tcpRemoteEndPoint);
+                    await client.StartAsync(cancellationTokenSource.Token);
                     break;
                 }
                 default:
@@ -73,10 +76,18 @@ public static class Program
                     break;
             }
         }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("应用程序已停止");
+        }
         catch (Exception ex)
         {
             Console.WriteLine($"启动失败: {ex.Message}");
             Console.WriteLine($"错误详情: {ex}");
         }
+        
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
     }
 }

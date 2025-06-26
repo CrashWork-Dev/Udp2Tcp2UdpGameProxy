@@ -1,55 +1,109 @@
 ﻿using System.Net;
 using System.Net.Sockets;
+// ReSharper disable InconsistentNaming
 
 namespace Udp2Tcp2UdpGameProxy;
 
-internal class UdpToTcpClient(IPEndPoint udpLocalEndPoint, IPEndPoint tcpRemoteEndPoint)
+internal class UdpToTcpClient(IPEndPoint localEndPoint, IPEndPoint remoteEndPoint) : IDisposable
 {
+    private readonly IPEndPoint _udpLocalEndPoint = localEndPoint ?? throw new ArgumentNullException(nameof(localEndPoint));
+    private readonly IPEndPoint _tcpRemoteEndPoint = remoteEndPoint ?? throw new ArgumentNullException(nameof(remoteEndPoint));
     private UdpClient? _udpServer;
     private TcpClient? _tcpClient;
     private NetworkStream? _tcpStream;
-    private CancellationTokenSource? _cancellationTokenSource;
+    private bool _disposed;
+    
+    private static readonly TimeSpan ConnectionTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(3);
 
-    public async Task StartAsync()
+    public async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        _cancellationTokenSource = new CancellationTokenSource();
-        _udpServer = new UdpClient(udpLocalEndPoint);
+        if (!_disposed)
+            try
+            {
+                _udpServer = new UdpClient(_udpLocalEndPoint);
 
-        Console.WriteLine("UDP To TCP 客户端启动");
-        Console.WriteLine($"本地UDP监听: {udpLocalEndPoint}");
-        Console.WriteLine($"远程TCP服务器: {tcpRemoteEndPoint}");
-        Console.WriteLine("等待游戏客户端连接...\n");
+                Console.WriteLine("UDP To TCP 客户端启动");
+                Console.WriteLine($"本地UDP监听: {_udpLocalEndPoint}");
+                Console.WriteLine($"远程TCP服务器: {_tcpRemoteEndPoint}");
+                Console.WriteLine("等待游戏客户端连接...\n");
 
-        try
-        {
-            await ConnectToTcpServerAsync();
-            await Task.WhenAll(
-                ReceiveUdpPacketsAsync(_cancellationTokenSource.Token),
-                ReceiveTcpDataAsync(_cancellationTokenSource.Token)
-            );
-        }
-        catch (OperationCanceledException)
-        {
-            Console.WriteLine("客户端已停止");
-        }
+                await ConnectToTcpServerAsync(cancellationToken);
+                
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                var token = linkedCts.Token;
+
+                var tasks = new[]
+                {
+                    ReceiveUdpPacketsAsync(token),
+                    ReceiveTcpDataAsync(token)
+                };
+
+                try
+                {
+                    await Task.WhenAny(tasks);
+                }
+                finally
+                {
+                    await linkedCts.CancelAsync();
+                    await Task.WhenAll(tasks.Select(async t =>
+                    {
+                        try
+                        {
+                            await t.WaitAsync(TimeSpan.FromSeconds(5), token);
+                        }
+                        catch
+                        {
+                            // ignored
+                        }
+                    }));
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                Console.WriteLine("客户端已停止");
+            }
+            finally
+            {
+                await CleanupAsync();
+            }
+        else
+            throw new ObjectDisposedException(nameof(UdpToTcpClient));
     }
 
-    private async Task ConnectToTcpServerAsync()
+    private async Task ConnectToTcpServerAsync(CancellationToken cancellationToken)
     {
-        while (_cancellationTokenSource?.IsCancellationRequested == false)
+        while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
+                await DisposeTcpConnectionAsync();
+                
                 _tcpClient = new TcpClient();
-                await _tcpClient.ConnectAsync(tcpRemoteEndPoint.Address, tcpRemoteEndPoint.Port);
+                
+                using var timeoutCts = new CancellationTokenSource(ConnectionTimeout);
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
+                
+                await _tcpClient.ConnectAsync(_tcpRemoteEndPoint.Address, _tcpRemoteEndPoint.Port, linkedCts.Token);
                 _tcpStream = _tcpClient.GetStream();
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 已连接到TCP服务器: {tcpRemoteEndPoint}");
+                
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 已连接到TCP服务器: {_tcpRemoteEndPoint}");
                 break;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 连接TCP服务器失败: {ex.Message}，3秒后重试...");
-                await Task.Delay(3000);
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] 连接TCP服务器失败: {ex.Message}，{ReconnectDelay.TotalSeconds}秒后重试...");
+                
+                await DisposeTcpConnectionAsync();
+                
+                try
+                {
+                    await Task.Delay(ReconnectDelay, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
             }
         }
     }
@@ -60,43 +114,56 @@ internal class UdpToTcpClient(IPEndPoint udpLocalEndPoint, IPEndPoint tcpRemoteE
         {
             try
             {
-                var result = await _udpServer!.ReceiveAsync(cancellationToken);
+                if (_udpServer == null) break;
+                
+                var result = await _udpServer.ReceiveAsync(cancellationToken);
                 var clientEndPoint = result.RemoteEndPoint;
                 var data = result.Buffer;
 
-                // 构造包头：客户端IP:端口信息
-                var clientInfo = $"{clientEndPoint.Address}:{clientEndPoint.Port}";
-                var clientInfoBytes = System.Text.Encoding.UTF8.GetBytes(clientInfo);
-                var clientInfoLength = BitConverter.GetBytes(clientInfoBytes.Length);
-                var dataLength = BitConverter.GetBytes(data.Length);
-
-                // 发送格式：[ClientInfoLength:4][ClientInfo][DataLength:4][Data]
                 if (_tcpStream != null && _tcpClient?.Connected == true)
                 {
-                    await _tcpStream.WriteAsync(clientInfoLength.AsMemory(0, 4), cancellationToken);
-                    await _tcpStream.WriteAsync(clientInfoBytes, cancellationToken);
-                    await _tcpStream.WriteAsync(dataLength.AsMemory(0, 4), cancellationToken);
-                    await _tcpStream.WriteAsync(data, cancellationToken);
-                    await _tcpStream.FlushAsync(cancellationToken);
-
+                    await SendToTcpAsync(clientEndPoint, data, cancellationToken);
                     Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] UDP->TCP: {clientEndPoint} ({data.Length} bytes)");
                 }
                 else
                 {
                     Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] TCP连接断开，尝试重连...");
-                    await ConnectToTcpServerAsync();
+                    await ConnectToTcpServerAsync(cancellationToken);
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (ObjectDisposedException)
+            {
+                break;
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] UDP接收错误: {ex.Message}");
-                if (ex is ObjectDisposedException) break;
             }
         }
     }
 
+    private async Task SendToTcpAsync(IPEndPoint clientEndPoint, byte[] data, CancellationToken cancellationToken)
+    {
+        var clientInfo = $"{clientEndPoint.Address}:{clientEndPoint.Port}";
+        var clientInfoBytes = System.Text.Encoding.UTF8.GetBytes(clientInfo);
+        var clientInfoLength = BitConverter.GetBytes(clientInfoBytes.Length);
+        var dataLength = BitConverter.GetBytes(data.Length);
+        
+        await _tcpStream!.WriteAsync(clientInfoLength.AsMemory(0, 4), cancellationToken);
+        await _tcpStream.WriteAsync(clientInfoBytes.AsMemory(), cancellationToken);
+        await _tcpStream.WriteAsync(dataLength.AsMemory(0, 4), cancellationToken);
+        await _tcpStream.WriteAsync(data.AsMemory(), cancellationToken);
+        await _tcpStream.FlushAsync(cancellationToken);
+    }
+
     private async Task ReceiveTcpDataAsync(CancellationToken cancellationToken)
     {
+        var lengthBuffer = new byte[4];
+        
         while (!cancellationToken.IsCancellationRequested)
         {
             try
@@ -106,40 +173,60 @@ internal class UdpToTcpClient(IPEndPoint udpLocalEndPoint, IPEndPoint tcpRemoteE
                     await Task.Delay(1000, cancellationToken);
                     continue;
                 }
-
-                // 读取客户端信息长度
-                var clientInfoLengthBytes = new byte[4];
-                await ReadExactAsync(_tcpStream, clientInfoLengthBytes, 4, cancellationToken);
-                var clientInfoLength = BitConverter.ToInt32(clientInfoLengthBytes, 0);
-
-                // 读取客户端信息
-                var clientInfoBytes = new byte[clientInfoLength];
-                await ReadExactAsync(_tcpStream, clientInfoBytes, clientInfoLength, cancellationToken);
-                var clientInfo = System.Text.Encoding.UTF8.GetString(clientInfoBytes);
-
-                // 读取数据长度
-                var dataLengthBytes = new byte[4];
-                await ReadExactAsync(_tcpStream, dataLengthBytes, 4, cancellationToken);
-                var dataLength = BitConverter.ToInt32(dataLengthBytes, 0);
-
-                // 读取数据
-                var data = new byte[dataLength];
-                await ReadExactAsync(_tcpStream, data, dataLength, cancellationToken);
-
-                // 解析客户端地址并转发UDP数据
-                var parts = clientInfo.Split(':');
-                if (parts.Length != 2 || !IPAddress.TryParse(parts[0], out var ip) ||
-                    !int.TryParse(parts[1], out var port)) continue;
-                var targetEndPoint = new IPEndPoint(ip, port);
-                await _udpServer!.SendAsync(data, data.Length, targetEndPoint);
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] TCP->UDP: {targetEndPoint} ({data.Length} bytes)");
+                await ProcessTcpMessageAsync(lengthBuffer, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (EndOfStreamException)
+            {
+                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] TCP连接被远程关闭");
+                await ConnectToTcpServerAsync(cancellationToken);
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] TCP接收错误: {ex.Message}");
-                if (ex is ObjectDisposedException) break;
-                    
-                await ConnectToTcpServerAsync();
+                await ConnectToTcpServerAsync(cancellationToken);
+            }
+        }
+    }
+
+    private async Task ProcessTcpMessageAsync(byte[] lengthBuffer, CancellationToken cancellationToken)
+    {
+        await ReadExactAsync(_tcpStream!, lengthBuffer, 4, cancellationToken);
+        var clientInfoLength = BitConverter.ToInt32(lengthBuffer, 0);
+
+        if (clientInfoLength is <= 0 or > 1024)
+            throw new InvalidDataException($"无效的客户端信息长度: {clientInfoLength}");
+        
+        var clientInfoBytes = new byte[clientInfoLength];
+        await ReadExactAsync(_tcpStream!, clientInfoBytes, clientInfoLength, cancellationToken);
+        var clientInfo = System.Text.Encoding.UTF8.GetString(clientInfoBytes);
+        
+        await ReadExactAsync(_tcpStream!, lengthBuffer, 4, cancellationToken);
+        var dataLength = BitConverter.ToInt32(lengthBuffer, 0);
+
+        switch (dataLength)
+        {
+            case < 0 or > 65507:
+                throw new InvalidDataException($"无效的数据长度: {dataLength}");
+            case > 0:
+            {
+                var data = new byte[dataLength];
+                await ReadExactAsync(_tcpStream!, data, dataLength, cancellationToken);
+
+                var parts = clientInfo.Split(':');
+                if (parts.Length == 2 && 
+                    IPAddress.TryParse(parts[0], out var ip) && 
+                    int.TryParse(parts[1], out var port))
+                {
+                    var targetEndPoint = new IPEndPoint(ip, port);
+                    await _udpServer!.SendAsync(data, data.Length, targetEndPoint);
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] TCP->UDP: {targetEndPoint} ({data.Length} bytes)");
+                }
+
+                break;
             }
         }
     }
@@ -153,5 +240,63 @@ internal class UdpToTcpClient(IPEndPoint udpLocalEndPoint, IPEndPoint tcpRemoteE
             if (read == 0) throw new EndOfStreamException("连接已关闭");
             totalRead += read;
         }
+    }
+
+    private async Task DisposeTcpConnectionAsync()
+    {
+        if (_tcpStream != null)
+        {
+            try
+            {
+                await _tcpStream.DisposeAsync();
+            }
+            catch
+            {
+                // ignored
+            }
+            _tcpStream = null;
+        }
+
+        if (_tcpClient != null)
+        {
+            try
+            {
+                _tcpClient.Close();
+                _tcpClient.Dispose();
+            }
+            catch
+            {
+                // ignored
+            }
+            _tcpClient = null;
+        }
+    }
+
+    private async Task CleanupAsync()
+    {
+        await DisposeTcpConnectionAsync();
+        
+        if (_udpServer != null)
+        {
+            try
+            {
+                _udpServer.Close();
+                _udpServer.Dispose();
+            }
+            catch
+            {
+                // ignored
+            }
+            _udpServer = null;
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        
+        _disposed = true;
+        CleanupAsync().GetAwaiter().GetResult();
+        GC.SuppressFinalize(this);
     }
 }
